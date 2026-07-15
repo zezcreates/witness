@@ -424,6 +424,607 @@
 </div>
 
 <script>
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbymAovwFi7jIms1Ki4OlhLC5qBTn2jiNdO4Tm5bb0OAHWocxzgQp3mKJzD1iQ9taN-K/exec';
+
+let entries = [];
+let selectedContext = null;
+let selectedRead = null;
+
+function pad(n) { return n.toString().padStart(2, '0'); }
+
+function toLocalInputValue(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatDisplay(iso) {
+  const d = new Date(iso);
+  const opts = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
+  return d.toLocaleString('en-US', opts);
+}
+
+async function loadEntries() {
+  try {
+    const res = await fetch(SCRIPT_URL);
+    const data = await res.json();
+    entries = data.map(row => ({
+      id: String(row.id),
+      time: row.time,
+      context: row.context,
+      moment: row.moment,
+      read: row.read,
+      note: row.note
+    }));
+  } catch (e) {
+    console.error('Load failed', e);
+    entries = [];
+  }
+  render();
+}
+
+async function persistEntry(entry) {
+  try {
+    await fetch(SCRIPT_URL, {
+      method: 'POST',
+      body: JSON.stringify(entry)
+    });
+  } catch (e) {
+    console.error('Save failed', e);
+  }
+}
+
+function render() {
+  const listArea = document.getElementById('listArea');
+  const reflection = document.getElementById('reflection');
+
+  if (entries.length === 0) {
+    reflection.classList.remove('show');
+    listArea.innerHTML = `<div class="empty">No entries yet.<br>When a reminder nudges you, come back and write down what happened.</div>`;
+    return;
+  }
+
+  const beforeCount = entries.filter(e => e.read === 'before').length;
+  const afterCount = entries.filter(e => e.read === 'after').length;
+  reflection.classList.add('show');
+  reflection.textContent = `${entries.length} entries logged — caught it before ${beforeCount}×, caught it after ${afterCount}×.`;
+
+  const sorted = [...entries].sort((a, b) => new Date(b.time) - new Date(a.time));
+
+  listArea.innerHTML = `<div class="entries">` + sorted.map(e => `
+    <div class="entry">
+      <div class="entry-top">
+        <span class="entry-time">${formatDisplay(e.time)}</span>
+        <span class="entry-tag">${e.context}</span>
+      </div>
+      <div class="entry-body">${escapeHtml(e.moment)}</div>
+      ${e.note ? `<div class="entry-note">${escapeHtml(e.note)}</div>` : ''}
+      <div class="entry-read ${e.read === 'before' ? 'read-before' : 'read-after'}">
+        ${e.read === 'before' ? 'Wanted to be seen' : 'Hustled to be seen'}
+      </div>
+    </div>
+  `).join('') + `</div>`;
+
+  renderPatterns();
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function openForm() {
+  selectedContext = null;
+  selectedRead = null;
+  document.getElementById('fTime').value = toLocalInputValue(new Date());
+  document.getElementById('fMoment').value = '';
+  document.getElementById('fNote').value = '';
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
+  document.querySelectorAll('.read-btn').forEach(c => c.classList.remove('selected'));
+  document.getElementById('overlay').classList.add('show');
+}
+
+function closeForm(e) {
+  document.getElementById('overlay').classList.remove('show');
+}
+
+document.getElementById('contextChips').addEventListener('click', (e) => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
+  chip.classList.add('selected');
+  selectedContext = chip.dataset.val;
+});
+
+document.getElementById('readOptions').addEventListener('click', (e) => {
+  const btn = e.target.closest('.read-btn');
+  if (!btn) return;
+  document.querySelectorAll('.read-btn').forEach(c => c.classList.remove('selected'));
+  btn.classList.add('selected');
+  selectedRead = btn.dataset.val;
+});
+
+async function saveEntry() {
+  const time = document.getElementById('fTime').value;
+  const moment = document.getElementById('fMoment').value.trim();
+  const note = document.getElementById('fNote').value.trim();
+
+  if (!time || !moment || !selectedContext || !selectedRead) {
+    alert('Fill in when, where, what happened, and the honest read — that\'s what makes this useful.');
+    return;
+  }
+
+  const newEntry = {
+    id: Date.now().toString(),
+    time: new Date(time).toISOString(),
+    context: selectedContext,
+    moment,
+    read: selectedRead,
+    note
+  };
+
+  entries.push(newEntry);
+  await persistEntry(newEntry);
+  closeForm();
+  render();
+}
+
+function switchTab(tab) {
+  document.getElementById('tabLog').classList.toggle('active', tab === 'log');
+  document.getElementById('tabPatterns').classList.toggle('active', tab === 'patterns');
+  document.getElementById('logTab').style.display = tab === 'log' ? 'block' : 'none';
+  document.getElementById('patternsTab').style.display = tab === 'patterns' ? 'block' : 'none';
+  if (tab === 'patterns') renderPatterns();
+}
+
+function renderPatterns() {
+  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const dayCounts = [0, 0, 0, 0, 0, 0, 0]; // index 0 = Mon ... 6 = Sun
+
+  const timeBuckets = [
+    { label: 'Morning', test: h => h < 11 },
+    { label: 'Midday', test: h => h >= 11 && h < 14 },
+    { label: 'Afternoon', test: h => h >= 14 && h < 17 },
+    { label: 'End of day', test: h => h >= 17 }
+  ];
+  const timeCounts = timeBuckets.map(() => 0);
+
+  entries.forEach(e => {
+    const d = new Date(e.time);
+    const jsDay = d.getDay(); // 0 = Sun
+    const idx = jsDay === 0 ? 6 : jsDay - 1; // shift to Mon=0..Sun=6
+    dayCounts[idx]++;
+
+    const hour = d.getHours();
+    const bIdx = timeBuckets.findIndex(b => b.test(hour));
+    if (bIdx !== -1) timeCounts[bIdx]++;
+  });
+
+  renderBarGroup('dayBars', dayNames, dayCounts);
+  renderBarGroup('timeBars', timeBuckets.map(b => b.label), timeCounts);
+}
+
+function renderBarGroup(containerId, labels, counts) {
+  const container = document.getElementById(containerId);
+  const total = counts.reduce((a, b) => a + b, 0);
+
+  if (total === 0) {
+    container.innerHTML = `<div class="pattern-empty">Not enough entries yet to show a pattern.</div>`;
+    return;
+  }
+
+  const max = Math.max(...counts, 1);
+  container.innerHTML = labels.map((label, i) => {
+    const count = counts[i];
+    const pct = Math.round((count / max) * 100);
+    return `
+      <div class="pattern-row">
+        <div class="pattern-label">${label}</div>
+        <div class="pattern-track"><div class="pattern-fill" style="width: ${count === 0 ? 0 : Math.max(pct, 6)}%;"></div></div>
+        <div class="pattern-count">${count}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+loadEntries();
+</script>
+
+</body>
+</html>    font-family: 'DM Serif Display', serif;
+    font-weight: 400;
+    font-size: 32px;
+    letter-spacing: 0.3px;
+  }
+
+  .tagline {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 4px;
+  }
+
+  .reflection {
+    margin-top: 20px;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--muted);
+    display: none;
+  }
+  .reflection.show { display: block; }
+
+  .new-btn {
+    width: 100%;
+    margin-top: 20px;
+    padding: 14px;
+    background: var(--accent);
+    color: #0d0d0d;
+    border: none;
+    border-radius: 10px;
+    font-family: 'Inter', sans-serif;
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+  }
+  .new-btn:active { opacity: 0.85; }
+
+  .empty {
+    margin-top: 60px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .entries {
+    margin-top: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .entry {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+
+  .entry-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+
+  .entry-time {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .entry-tag {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  .entry-read {
+    display: inline-block;
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    margin-top: 8px;
+  }
+  .read-before { background: rgba(138, 158, 130, 0.15); color: var(--accent); }
+  .read-after { background: rgba(184, 149, 106, 0.15); color: #c9a377; }
+
+  .entry-body {
+    font-size: 14px;
+    line-height: 1.5;
+    margin-top: 6px;
+  }
+
+  .entry-note {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 6px;
+    font-style: italic;
+  }
+
+  /* Modal */
+  .overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 10;
+  }
+  .overlay.show { display: block; }
+
+  .sheet {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    border-radius: 18px 18px 0 0;
+    padding: 22px 20px 30px;
+    max-width: 480px;
+    margin: 0 auto;
+    max-height: 88vh;
+    overflow-y: auto;
+    z-index: 11;
+  }
+
+  .sheet h2 {
+    font-family: 'DM Serif Display', serif;
+    font-weight: 400;
+    font-size: 22px;
+    margin-bottom: 18px;
+  }
+
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    margin-top: 18px;
+  }
+
+  input[type="datetime-local"], textarea {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-weight: 300;
+    font-size: 14px;
+    padding: 10px 12px;
+  }
+
+  textarea { resize: vertical; min-height: 60px; }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .chip {
+    padding: 8px 14px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .chip.selected {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .read-options {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .read-btn {
+    padding: 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    text-align: left;
+    line-height: 1.4;
+  }
+
+  .read-btn .sub {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 3px;
+    font-weight: 300;
+  }
+
+  .read-btn.selected {
+    border-color: var(--accent);
+    background: rgba(138, 158, 130, 0.08);
+  }
+
+  .sheet-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 26px;
+  }
+
+  .sheet-actions button {
+    flex: 1;
+    padding: 13px;
+    border-radius: 10px;
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  .btn-cancel {
+    background: transparent;
+    border: 1px solid var(--border) !important;
+    color: var(--muted);
+  }
+
+  .btn-save {
+    background: var(--accent);
+    color: #0d0d0d;
+  }
+
+  .btn-save:disabled {
+    opacity: 0.35;
+  }
+
+  .loading { color: var(--muted); font-size: 13px; margin-top: 20px; }
+
+  .tabs {
+    display: flex;
+    gap: 22px;
+    margin-top: 22px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tab {
+    font-size: 13px;
+    color: var(--muted);
+    padding-bottom: 10px;
+    border-bottom: 2px solid transparent;
+  }
+
+  .tab.active {
+    color: var(--text);
+    border-bottom: 2px solid var(--accent);
+  }
+
+  .pattern-section {
+    margin-top: 26px;
+  }
+
+  .pattern-title {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .pattern-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .pattern-label {
+    width: 78px;
+    flex-shrink: 0;
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .pattern-track {
+    flex: 1;
+    height: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .pattern-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 6px;
+    opacity: 0.75;
+  }
+
+  .pattern-count {
+    width: 20px;
+    text-align: right;
+    font-size: 12px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  .pattern-empty {
+    color: var(--muted);
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Witness</h1>
+  <div class="tagline">Catch the moment you wanted to be seen.</div>
+</header>
+
+<div class="reflection" id="reflection"></div>
+
+<div class="tabs">
+  <div class="tab active" id="tabLog" onclick="switchTab('log')">Log</div>
+  <div class="tab" id="tabPatterns" onclick="switchTab('patterns')">Patterns</div>
+</div>
+
+<div id="logTab">
+<button class="new-btn" onclick="openForm()">+ New entry</button>
+
+<div id="listArea">
+  <div class="loading">Loading…</div>
+</div>
+</div>
+
+<div id="patternsTab" style="display:none;">
+  <div class="pattern-section">
+    <div class="pattern-title">By day of week</div>
+    <div id="dayBars"></div>
+  </div>
+  <div class="pattern-section">
+    <div class="pattern-title">By time of day</div>
+    <div id="timeBars"></div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" onclick="closeForm(event)">
+  <div class="sheet" onclick="event.stopPropagation()">
+    <h2>What happened</h2>
+
+    <label>When</label>
+    <input type="datetime-local" id="fTime">
+
+    <label>Where</label>
+    <div class="chips" id="contextChips">
+      <div class="chip" data-val="Meeting">Meeting</div>
+      <div class="chip" data-val="1:1">1:1</div>
+      <div class="chip" data-val="Group">Group</div>
+      <div class="chip" data-val="Async">Async / chat</div>
+      <div class="chip" data-val="Informal">Informal (lunch, hallway)</div>
+      <div class="chip" data-val="Family">Non-Work (Family)</div>
+      <div class="chip" data-val="Friend">Non-Work (Friend)</div>
+      <div class="chip" data-val="Stranger">Random Person</div>
+      <div class="chip" data-val="Other">Other</div>
+    </div>
+
+    <label>What did you want to say or do?</label>
+    <textarea id="fMoment" placeholder="The thing you almost said, or did..."></textarea>
+
+    <label>What was actually underneath it, honestly?</label>
+    <div class="read-options" id="readOptions">
+      <div class="read-btn" data-val="before">
+        Wanted to be seen
+        <span class="sub">Caught the pull before I said or did it</span>
+      </div>
+      <div class="read-btn" data-val="after">
+        Hustled to be seen
+        <span class="sub">Already said or did it — seeing it now, after the fact</span>
+      <div class="read-btn" data-val="fear">
+        Fear of being minimized
+        <span class="sub">I feel my worth is in question and I need to defend myself</span></div>
+    </div>
+
+    <label>Anything else, in one sentence (optional)</label>
+    <textarea id="fNote" placeholder="One line, no more..." style="min-height: 40px;"></textarea>
+
+    <div class="sheet-actions">
+      <button class="btn-cancel" onclick="closeForm()">Cancel</button>
+      <button class="btn-save" id="saveBtn" onclick="saveEntry()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
 let entries = [];
 let selectedContext = null;
 let selectedRead = null;
